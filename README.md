@@ -1,6 +1,6 @@
 # ESMA2025
 
-# name_of_pckg**
+# name_of_pckg
 
 This package is a Python module designed to **flag ESMA outliers** from different databases, supporting **various granularities** (quarterly, monthly, yearly) and **different anomaly detection methods** (statistical and machine learning).
 
@@ -8,7 +8,7 @@ It works flexibly with **Spark DataFrames** (for big data) and **Pandas DataFram
 
 ---
 
-## ✨ **Features**
+## **Features**
 
 - **Flexible time parsing:**
     - Supports `YYYY-QX`, `YYYY-MM`, `YYYY` formats.
@@ -23,7 +23,7 @@ It works flexibly with **Spark DataFrames** (for big data) and **Pandas DataFram
 
 ---
 
-## 🔧 **Installation**
+##  **Installation**
 
 Dependencies:
 
