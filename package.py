@@ -6,12 +6,11 @@ from pyspark.sql import DataFrame
 from pyspark.ml.feature import VectorAssembler
 from pyspark.ml.regression import RandomForestRegressor as SparkRF
 from pyspark.ml import Pipeline
-from sklearn.ensemble import RandomForestRegressor as SklearnRF
+from sklearn.ensemble import RandomForestRegressor
 from functools import reduce
 
-# =====================
-# 1️⃣ UDF: Flexible Date Parser
-# =====================
+# Date parser for Spark dataframes
+
 def get_parse_date_udf():
     @f.udf(returnType=TimestampType())
     def parse_date_flex(date_str):
@@ -37,9 +36,8 @@ def get_parse_date_udf():
     return parse_date_flex
 
 
-# =====================
-# 2️⃣ Threshold Outliers
-# =====================
+#  Threshold Outliers Function
+
 def add_outlier_thresholds(
     data: DataFrame,
     numbercol: str,
@@ -105,10 +103,118 @@ def add_outlier_thresholds(
 
     return data
 
+def melisa_outliers(
+    spark_df,
+    mode='thresholds',
+    numbercol='OBS_VALUE',
+    groupbycols=None,
+    showstats=False,
+    use_logs=False,
+    min_filter=None,
+    min_date=None,
+    feature_cols=None,
+    datecol='parsed_date'
+):
+    if groupbycols is None:
+        groupbycols = []
+# changable if cond (containing q or not), DONE
+    spark_df = spark_df.withColumn(datecol, parse_date_flex(f.col('TIME_PERIOD')))
 
-# =====================
-# 3️⃣ Random Forest Outliers (Pandas)
-# =====================
+    if min_date:
+        spark_df = spark_df.filter(f.col(datecol) >= f.lit(min_date))
+
+    if min_filter:
+        spark_df = spark_df.filter(f.col(numbercol) >= min_filter)
+
+
+
+    if mode == 'random_forest_regressor':
+        df_pd = spark_df.toPandas()
+        # 3) Figure out features
+        if feature_cols is None:
+            numeric = df_pd.select_dtypes(include=['float','int']).columns.tolist()
+            feature_cols = [c for c in numeric if c != numbercol]
+
+        # Helper to train & flag per group
+        def process_group(grp):
+            if grp.shape[0] < 10:
+                grp['rfr_outlier'] = False
+                return grp
+
+            X = grp[feature_cols]
+            y = grp[numbercol]
+            model = RandomForestRegressor(n_estimators=50, random_state=42)
+            model.fit(X, y)
+
+            grp['pred_rfr']      = model.predict(X)
+            grp['residual_rfr']  = grp[numbercol] - grp['pred_rfr']
+            sd = grp['residual_rfr'].std()
+            thresh = 4 * sd
+
+            grp['rfr_outlier'] = grp['residual_rfr'].abs() > thresh
+            return grp
+
+        # 4) Apply per‐group (or once if no grouping)
+        if groupbycols:
+            df_out = (
+                df_pd
+                .groupby(groupbycols, group_keys=False)
+                .apply(process_group)
+                .reset_index(drop=True)
+            )
+        else:
+            df_out = process_group(df_pd)
+
+        if showstats:
+            print(df_out['rfr_outlier'].value_counts())
+
+        # 5) Anything under min_filter must be False
+        if min_filter is not None:
+            df_out.loc[df_out[numbercol] < min_filter, 'rfr_outlier'] = False
+
+        return spark.createDataFrame(df_out)
+    #assumin connection already exists?s
+
+    elif mode == 'thresholds':
+        # apply the existing threshold logic
+        df_thresh = spark_df
+        if min_filter is not None:
+            df_thresh = df_thresh.filter(f.col(numbercol) >= min_filter)
+        if min_date is not None:
+            # make sure parsed_date column exists as date
+            df_thresh = df_thresh.withColumn(
+                datecol,
+                f.to_date(f.col('TIME_PERIOD').substr(1,4).cast('int').cast('string')  # crude: extract year; adjust if you have parsed_date as a column
+            )).filter(f.col(datecol) >= f.lit(min_date))
+
+        # run your threshold outlier function, which gives back only the key cols + value + flag
+        outliers_only = add_outlier_thresholds(
+            data=df_thresh,
+            numbercol=numbercol,
+            groupbycols=groupbycols,
+            showstats=showstats,
+            use_logs=use_logs
+        )
+
+        # now join back to the original spark_df on the grouping keys + TIME_PERIOD + numbercol
+        join_keys = groupbycols + ['TIME_PERIOD', numbercol]
+        full_with_flags = spark_df.join(
+            outliers_only.select(*join_keys, 'is_outlier'),
+            on=join_keys,
+            how='left'
+        ).withColumn(
+            'is_outlier',
+            f.coalesce(f.col('is_outlier'), f.lit(False))
+        )
+
+        return full_with_flags
+
+    else:
+        raise ValueError(f"Unknown mode: {mode}")
+
+
+# Random Forest Outliers (Pandas)
+
 def rf_outliers_pandas(
     df_pd,
     numbercol,
@@ -125,7 +231,7 @@ def rf_outliers_pandas(
             return grp
         X = grp[feature_cols]
         y = grp[numbercol]
-        model = SklearnRF(n_estimators=50, random_state=42)
+        model = RandomForestRegressor(n_estimators=50, random_state=42)
         model.fit(X, y)
         grp['pred_rfr'] = model.predict(X)
         grp['residual_rfr'] = grp[numbercol] - grp['pred_rfr']
@@ -149,9 +255,8 @@ def rf_outliers_pandas(
     return df_out
 
 
-# =====================
-# 4️⃣ Lag Feature Prep (Spark)
-# =====================
+# Lag Feature Prep (Spark)
+
 def add_lag_features(
     df: DataFrame,
     groupbycols,
@@ -171,9 +276,9 @@ def add_lag_features(
     return df
 
 
-# =====================
-# 5️⃣ RandomForest Spark Model
-# =====================
+
+# RandomForest Spark Model
+
 def rf_outliers_spark(
     df: DataFrame,
     feature_cols,
@@ -195,9 +300,8 @@ def rf_outliers_spark(
     return preds
 
 
-# =====================
-# 🔧 Utility: Plotting (Matplotlib)
-# =====================
+
+# Plotting (Matplotlib) ((( i will change this so it is within functionality+ add plotly)))
 def plot_outliers_matplotlib(
     df_pd,
     date_col,
