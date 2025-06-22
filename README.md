@@ -15,27 +15,27 @@ All methods are wrapped to be reusable on grouped, quarterly/monthly time series
 
 ## Features
 
-### ✅ Statistical Threshold Flagging (PySpark)
+### Statistical Threshold Flagging (PySpark)
 - Median ± 3σ / 4σ outlier detection per group
 - Optional log-transform and group filtering
 - Implemented for distributed Spark DataFrames with optional `.groupBy()`
 
-### ⚖️ Random Forest Regressor
+### Random Forest Regressor
 - Predicts value using other numeric features
 - Flags based on high residual errors
 - Can be used per group or globally
 
-### 🔢 ARIMA-Based Forecasting
+### ARIMA-Based Forecasting
 - Automatically fits seasonal ARIMA on each key
 - Flags points with forecast residuals > 3 standard deviations
 - Generates interactive ESMA-style Plotly charts with forecast lines and flagged outliers
 
-### 🧠 Sliding-Window Outliers
+### Sliding-Window Outliers
 - Rolling mean + rolling standard deviation or MAD
 - Robust to seasonal drift
 - Interactive visualizations included
 
-### 🧬 Autoencoder Detection
+### Autoencoder Detection
 - Sliding-window neural network for reconstruction error analysis
 - Flags high-error segments
 - Plots MSE and visual timelines of detected outliers
