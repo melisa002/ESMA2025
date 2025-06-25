@@ -27,7 +27,6 @@ import scipy.stats as stats
 from pyspark.sql.functions import udf, col
 from pyspark.sql.types import TimestampType
 from pyspark.sql.window import Window
-from skforecast.recursive import ForecasterRecursive
 from sklearn.tree import DecisionTreeRegressor
 from pyspark.ml.feature import VectorAssembler
 from pyspark.ml import Pipeline
@@ -35,7 +34,6 @@ import pyspark.sql.functions as f
 from functools import reduce
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.preprocessing import MinMaxScaler
-from pyod.models.hbos import HBOS
 from sklearn.preprocessing import StandardScaler, RobustScaler
 from sklearn.ensemble import IsolationForest
 
@@ -325,6 +323,7 @@ def _infer_freq_and_m(index: pd.DatetimeIndex):
             freq = 'D' if diffs[0] == 1 else 'M' if 28 <= diffs[0] <= 31 else None
         if freq is None:
             raise ValueError(f"Could not infer a consistent freq from index: {index[:5]}")
+
     # map to seasonal period
     if freq.startswith('Q'):
         m = 4
@@ -342,9 +341,9 @@ def _infer_freq_and_m(index: pd.DatetimeIndex):
 def fit_arima_and_flag_outliers(
         df: pd.DataFrame,
         key: str,
-        key_col: str = 'key',
-        date_col: str = 'period',
-        value_col: str = 'value'):
+        key_col: str = 'KEY',
+        date_col: str = 'TIME_PERIOD',
+        value_col: str = 'OBS_VALUE'):
     """
     Filter df by key, fit a seasonal ARIMA, and flag outliers beyond 3σ.
 
@@ -486,7 +485,7 @@ def fit_autoencoder_and_flag_outliers(
             if len(group_df) < window_size * 2:
                 print(f"Insufficient data for group (need >{window_size*2}, got {len(group_df)})")
                 group_df['recon_error'] = 0.0
-                group_df['is_outlier'] = False
+                group_df[f"{numbercol}_is_outlier"] = False
                 return group_df.reset_index()
 
             series = group_df[numbercol].astype(float)
@@ -509,7 +508,7 @@ def fit_autoencoder_and_flag_outliers(
 
             if len(X) < 10:  # Need minimum samples for training
                 group_df['recon_error'] = 0.0
-                group_df['is_outlier'] = False
+                group_df[f"{numbercol}_is_outlier"] = False
                 return group_df.reset_index()
 
             # Build autoencoder
@@ -543,14 +542,14 @@ def fit_autoencoder_and_flag_outliers(
 
             # Initialize columns with default values
             group_df['recon_error'] = 0.0
-            group_df['is_outlier'] = False
+            group_df[f"{numbercol}_is_outlier"] = False
 
             # Map errors to corresponding dates (window end dates)
             window_end_dates = series.index[window_size - 1:]
             for i, date in enumerate(window_end_dates):
                 if date in group_df.index:
                     group_df.loc[date, 'recon_error'] = mse[i]
-                    group_df.loc[date, 'is_outlier'] = mse[i] > err_thresh
+                    group_df.loc[date, f"{numbercol}_is_outlier"] = mse[i] > err_thresh
 
             if showstats:
                 outlier_count = (mse > err_thresh).sum()
@@ -562,7 +561,7 @@ def fit_autoencoder_and_flag_outliers(
             print(f"Error processing group: {e}")
             # Return group with no outliers marked
             group_df['recon_error'] = 0.0
-            group_df['is_outlier'] = False
+            group_df[f"{numbercol}_is_outlier"] = False
             if date_col in group_df.index.names:
                 return group_df.reset_index()
             return group_df
@@ -580,7 +579,7 @@ def fit_autoencoder_and_flag_outliers(
         result_df = process_single_key(df_pd)
 
     if showstats:
-        total_outliers = result_df['is_outlier'].sum()
+        total_outliers = result_df[f"{numbercol}_is_outlier"].sum()
         total_points = len(result_df)
         print(f"[AUTOENCODER OUTLIERS] {numbercol}: {total_outliers}/{total_points} ({total_outliers/total_points*100:.2f}%)")
 
@@ -650,15 +649,15 @@ def random_forest_outliers(
             result = (predictions.alias("pred")
                      .join(group_stats.alias("stats"), on=join_condition, how="left")
                      .withColumn("threshold", col("residual_std") * nr_sd)
-                     .withColumn("is_outlier", spark_abs(col("residual")) > col("threshold"))
+                     .withColumn(f"{numbercol}_is_outlier", spark_abs(col("residual")) > col("threshold"))
                      .drop("residual_std", "threshold"))
         else:
             residual_std = predictions.select(stddev("residual")).collect()[0][0]
             threshold = residual_std * nr_sd
-            result = predictions.withColumn("is_outlier", spark_abs(col("residual")) > threshold)
+            result = predictions.withColumn(f"{numbercol}_is_outlier", spark_abs(col("residual")) > threshold)
 
         if showstats:
-            outlier_count = result.filter(col("is_outlier")).count()
+            outlier_count = result.filter(col(f"{numbercol}_is_outlier")).count()
             total_count = result.count()
             print(f"Outliers: {outlier_count}, Normal: {total_count - outlier_count}")
 
@@ -680,7 +679,7 @@ def random_forest_outliers(
         # Helper to train & flag per group
         def process_group(grp):
             if grp.shape[0] < 10:
-                grp['is_outlier'] = False
+                grp[f"{numbercol}_is_outlier"] = False
                 return grp
 
             X = grp[feature_cols]
@@ -693,7 +692,7 @@ def random_forest_outliers(
             sd = grp['residual_rfr'].std()
             thresh = nr_sd * sd
 
-            grp['is_outlier'] = grp['residual_rfr'].abs() > thresh
+            grp[f"{numbercol}_is_outlier"] = grp['residual_rfr'].abs() > thresh
             return grp
 
         # Apply per‐group (or once if no grouping)
@@ -708,9 +707,9 @@ def random_forest_outliers(
             df_out = process_group(df_pd)
 
         if showstats:
-            print(df_out['is_outlier'].value_counts())
+            print(df_out[f"{numbercol}_is_outlier"].value_counts())
 
-        return spark_df.sql_ctx.createDataFrame(df_out)
+        return spark.createDataFrame(df_out)
 
 
 
@@ -750,7 +749,7 @@ def isolation_forest_outliers(
         small_clusters = cluster_counts.orderBy("count").limit(int(cluster_counts.count() * contamination))
         small_cluster_ids = [row.cluster for row in small_clusters.collect()]
 
-        result = clustered.withColumn("is_outlier", col("cluster").isin(small_cluster_ids))
+        result = clustered.withColumn(f"{numbercol}_is_outlier", col("cluster").isin(small_cluster_ids))
 
         print("✓ Spark ML clustering-based outlier detection succeeded")
         return result.drop("features_raw", "features", "cluster")
@@ -764,7 +763,7 @@ def isolation_forest_outliers(
 
         def compute_isolation_forest(group_df):
             if len(group_df) < 30:
-                group_df['is_outlier'] = False
+                group_df[f"{numbercol}_is_outlier"] = False
                 return group_df
 
             values = group_df[numbercol].values.reshape(-1, 1)
@@ -772,9 +771,9 @@ def isolation_forest_outliers(
             try:
                 iso = IsolationForest(contamination=contamination, random_state=42)
                 outliers = iso.fit_predict(values) == -1
-                group_df['is_outlier'] = outliers
+                group_df[f"{numbercol}_is_outlier"] = outliers
             except Exception:
-                group_df['is_outlier'] = False
+                group_df[f"{numbercol}_is_outlier"] = False
 
             return group_df
 
@@ -802,6 +801,7 @@ def hbos_outliers(
     """
     # Try Spark SQL histogram approach first
     try:
+        from pyod.models.hbos import HBOS
         from pyspark.sql.functions import col, count, when, desc, row_number
         from pyspark.sql.window import Window
 
@@ -827,7 +827,7 @@ def hbos_outliers(
             result = (result
                      .withColumn("bin_rank", row_number().over(windowSpec2))
                      .withColumn("total_bins", count("*").over(Window.partitionBy(groupbycols)))
-                     .withColumn("is_outlier", col("bin_rank") <= (col("total_bins") * contamination)))
+                     .withColumn(f"{numbercol}_is_outlier", col("bin_rank") <= (col("total_bins") * contamination)))
 
         else:
             windowSpec = Window.orderBy(col(numbercol))
@@ -843,7 +843,7 @@ def hbos_outliers(
             result = result.join(bin_counts, "bin", "left")
 
             min_count_threshold = total_count * contamination / n_bins
-            result = result.withColumn("is_outlier", col("bin_count") < min_count_threshold)
+            result = result.withColumn(f"{numbercol}_is_outlier", col("bin_count") < min_count_threshold)
 
         print("✓ Spark SQL histogram-based outlier detection succeeded")
         return result.drop("rank", "group_size", "percentile_rank", "bin", "bin_count", "bin_rank", "total_bins")
@@ -1071,9 +1071,9 @@ def plot_global_series_with_outliers(df, date_col='TIME_PERIOD',
         fig.add_trace(go.Scatter(
             x=df[date_col],
             y=df[value_col],
-            mode='lines',
+            mode='markers',
             name='OBS_VALUE',
-            line=dict(width=1),
+            line=dict(color="#007EFF",width=1),
             showlegend=True
         ))
 
@@ -1084,7 +1084,7 @@ def plot_global_series_with_outliers(df, date_col='TIME_PERIOD',
             y=outliers[value_col],
             mode='markers',
             name='Outliers (Top 1%)',
-            marker=dict(color='red', size=6),
+            marker=dict(color="#7BD200",size=6),
             showlegend=True
         ))
 
@@ -1342,7 +1342,7 @@ def spot(
     spark_df : pyspark.sql.DataFrame
         Input Spark DataFrame
     mode : str
-        Detection method: 'thresholds', 'percentile', 'hbos', 'random_forest',
+        Detection method: 'thresholds', 'percentile', 'hbos', 'random_forest_regressor',
         'arima', 'sliding_window', 'autoencoder', 'isolation_forest'
     numbercol : str
         Numeric column to analyze (default: 'OBS_VALUE')
@@ -1407,7 +1407,7 @@ def spot(
         if return_mode == 'all':
             return outliers_only
         elif return_mode == 'outliers':
-            return outliers_only.filter(f.col('is_outlier') == True)
+            return outliers_only.filter(f.col(f"{numbercol}_is_outlier") == True)
 
     # Machine Learning methods
     elif mode == 'hbos':
@@ -1423,7 +1423,7 @@ def spot(
         if return_mode == 'all':
             return df_with_outliers
         elif return_mode == 'outliers':
-            return df_with_outliers.filter(f.col('is_outlier') == True)
+            return df_with_outliers.filter(f.col(f"{numbercol}_is_outlier") == True)
 
     elif mode == 'random_forest_regressor':
         # Single function that tries Spark first, falls back to pandas
@@ -1438,7 +1438,7 @@ def spot(
         if return_mode == 'all':
             return df_with_outliers
         elif return_mode == 'outliers':
-            return df_with_outliers.filter(f.col('is_outlier') == True)
+            return df_with_outliers.filter(f.col(f"{numbercol}_is_outlier") == True)
 
     elif mode == 'isolation_forest':
         # Single function that tries Spark first, falls back to pandas
@@ -1452,7 +1452,7 @@ def spot(
         if return_mode == 'all':
             return df_with_outliers
         elif return_mode == 'outliers':
-            return df_with_outliers.filter(f.col('is_outlier') == True)
+            return df_with_outliers.filter(f.col(f"{numbercol}_is_outlier") == True)
 
     # Time series methods
     elif mode == 'arima':
@@ -1470,12 +1470,12 @@ def spot(
         )
 
         # Add is_outlier column for consistency
-        results_df['is_outlier'] = results_df['outlier']
+        results_df[f"{numbercol}_is_outlier"] = results_df['outlier']
 
         if return_mode == 'all':
             return results_df
         elif return_mode == 'outliers':
-            return results_df[results_df['is_outlier'] == True]
+            return results_df[results_df[f"{numbercol}_is_outlier"] == True]
 
     elif mode == 'sliding_window':
         df_pd = spark_df.toPandas()
@@ -1495,12 +1495,12 @@ def spot(
         )
 
         # Add is_outlier column for consistency
-        results_df['is_outlier'] = results_df['outlier']
+        results_df[f"{numbercol}_is_outlier"] = results_df['outlier']
 
         if return_mode == 'all':
             return results_df
         elif return_mode == 'outliers':
-            return results_df[results_df['is_outlier'] == True]
+            return results_df[results_df[f"{numbercol}_is_outlier"] == True]
 
     elif mode == 'autoencoder':
         # Use the new function that returns full Spark DataFrame
@@ -1522,7 +1522,7 @@ def spot(
         if return_mode == 'all':
             return df_with_outliers
         elif return_mode == 'outliers':
-            return df_with_outliers.filter(f.col('is_outlier') == True)
+            return df_with_outliers.filter(f.col(f"{numbercol}_is_outlier") == True)
 
     else:
         raise ValueError(f"Unknown mode: {mode}")
