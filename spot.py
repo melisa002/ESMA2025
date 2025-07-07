@@ -22,6 +22,7 @@ import pmdarima as pm
 import matplotlib.pyplot as plt
 from pyspark.sql import SparkSession
 import warnings
+from pyspark.sql import DataFrame
 import os
 import scipy.stats as stats
 from pyspark.sql.functions import udf, col
@@ -35,7 +36,8 @@ from functools import reduce
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.preprocessing import MinMaxScaler
 from sklearn.preprocessing import StandardScaler, RobustScaler
-from sklearn.ensemble import IsolationForest
+import warnings
+
 
 try:
     import esmaplotly as epy
@@ -46,6 +48,39 @@ except ImportError:
 
 warnings.filterwarnings("ignore", category=FutureWarning)
 os.environ["PYTHONWARNINGS"] = "ignore::FutureWarning"
+
+
+def parse_time_period(df: DataFrame, input_col: str = 'TIME_PERIOD', output_col: str = 'parsed_date') -> DataFrame:
+    parts = f.split(f.col(input_col), '-')
+
+    # Quarterly
+    is_quarter = f.col(input_col).like('%-Q%')
+    year_q = f.split(f.col(input_col), '-Q').getItem(0)
+    q_num = f.split(f.col(input_col), '-Q').getItem(1).cast('int')
+    q_month = f.expr("(int(split(" + input_col + ", '-Q')[1]) - 1) * 3 + 1")
+    q_month_padded = f.lpad(q_month.cast('string'), 2, '0')
+    date_q = f.to_date(f.concat_ws('-', year_q, q_month_padded, f.lit('01')))
+
+    # Monthly
+    is_month = (f.size(parts) == 2) & (~is_quarter)
+    year_m = parts.getItem(0)
+    month_m = f.lpad(parts.getItem(1), 2, '0')
+    date_m = f.to_date(f.concat_ws('-', year_m, month_m, f.lit('01')))
+
+    # Yearly
+    is_year = (f.length(f.col(input_col)) == 4) & f.col(input_col).rlike('^[0-9]{4}$')
+    year_y = f.col(input_col)
+    date_y = f.to_date(f.concat_ws('-', year_y, f.lit('01'), f.lit('01')))
+
+    # Combine with when
+    parsed_date_col = (
+        f.when(is_quarter, date_q)
+         .when(is_month, date_m)
+         .when(is_year, date_y)
+         .otherwise(f.lit(None).cast('date'))
+    )
+
+    return df.withColumn(output_col, parsed_date_col)
 
 
 # =============================================================================
@@ -602,11 +637,39 @@ def random_forest_outliers(
     feature_cols=None,
     groupbycols=None,
     nr_sd=4,
-    showstats=False
+    showstats=False,
+    key=None,
+    key_col='KEY'
 ):
     """
     Random Forest outlier detection - tries Spark ML first, falls back to pandas.
+
+    Parameters:
+    -----------
+    spark_df : pyspark.sql.DataFrame
+        Input Spark DataFrame
+    numbercol : str
+        Numeric column to analyze for outliers
+    feature_cols : list of str, optional
+        Feature columns for prediction. If None, auto-selects numeric columns
+    groupbycols : list of str, optional
+        Columns to group by when processing entire dataset
+    nr_sd : float
+        Number of standard deviations for outlier threshold
+    showstats : bool
+        Whether to print statistics
+    key : str, optional
+        Specific key value to filter on. If None, processes entire dataset
+    key_col : str
+        Column name containing the key values
     """
+    # Filter by key if provided
+    if key is not None:
+        spark_df = spark_df.filter(f.col(key_col) == key)
+        # When filtering by key, use key_col as grouping if no groupbycols specified
+        if groupbycols is None:
+            groupbycols = [key_col]
+
     # Try Spark ML first
     try:
         from pyspark.ml.feature import VectorAssembler
@@ -621,7 +684,7 @@ def random_forest_outliers(
             numeric_cols = []
             for field in spark_df.schema.fields:
                 if str(field.dataType) in ['DoubleType', 'FloatType', 'IntegerType', 'LongType']:
-                    if field.name != numbercol:
+                    if field.name != numbercol and (groupbycols is None or field.name not in groupbycols):
                         numeric_cols.append(field.name)
             feature_cols = numeric_cols[:10]
 
@@ -641,13 +704,9 @@ def random_forest_outliers(
                 stddev("residual").alias("residual_std")
             )
 
-            join_condition = reduce(
-                lambda x, y: x & y,
-                [col(f"pred.{gcol}") == col(f"stats.{gcol}") for gcol in groupbycols]
-            )
-
-            result = (predictions.alias("pred")
-                     .join(group_stats.alias("stats"), on=join_condition, how="left")
+            # Fixed join condition - use column names directly
+            result = (predictions
+                     .join(group_stats, on=groupbycols, how="left")
                      .withColumn("threshold", col("residual_std") * nr_sd)
                      .withColumn(f"{numbercol}_is_outlier", spark_abs(col("residual")) > col("threshold"))
                      .drop("residual_std", "threshold"))
@@ -659,7 +718,11 @@ def random_forest_outliers(
         if showstats:
             outlier_count = result.filter(col(f"{numbercol}_is_outlier")).count()
             total_count = result.count()
-            print(f"Outliers: {outlier_count}, Normal: {total_count - outlier_count}")
+            print(f"[RANDOM FOREST OUTLIERS] {numbercol}: {outlier_count}/{total_count}")
+            if groupbycols and key is None:
+                # Show per-group statistics when processing entire dataset
+                group_counts = result.groupBy(groupbycols + [f"{numbercol}_is_outlier"]).count()
+                group_counts.show()
 
         print("✓ Spark ML Random Forest succeeded")
         return result.drop("features", "prediction", "residual")
@@ -668,22 +731,46 @@ def random_forest_outliers(
         print(f"✗ Spark ML Random Forest failed: {e}")
         print("Falling back to pandas Random Forest...")
 
-        # Your original pandas implementation
+        # Pandas fallback implementation
         df_pd = spark_df.toPandas()
 
         # Figure out features
         if feature_cols is None:
             numeric = df_pd.select_dtypes(include=['float','int']).columns.tolist()
-            feature_cols = [c for c in numeric if c != numbercol]
+            feature_cols = [c for c in numeric if c != numbercol and (groupbycols is None or c not in groupbycols)]
 
         # Helper to train & flag per group
         def process_group(grp):
             if grp.shape[0] < 10:
                 grp[f"{numbercol}_is_outlier"] = False
+                grp['pred_rfr'] = grp[numbercol]  # Use actual value as prediction
+                grp['residual_rfr'] = 0
                 return grp
 
-            X = grp[feature_cols]
+            # Use the SAME feature selection logic as Spark
+            valid_features = []
+            for f in feature_cols:
+                if f in grp.columns:
+                    # Only include numeric columns (same as Spark's DoubleType, FloatType, IntegerType, LongType)
+                    if grp[f].dtype.kind in 'biufc':  # numeric types only
+                        valid_features.append(f)
+
+            if not valid_features:
+                grp[f"{numbercol}_is_outlier"] = False
+                grp['pred_rfr'] = grp[numbercol]
+                grp['residual_rfr'] = 0
+                return grp
+
+            X = grp[valid_features]
             y = grp[numbercol]
+
+            # Skip if not enough variance in features
+            if X.nunique().min() < 2:
+                grp[f"{numbercol}_is_outlier"] = False
+                grp['pred_rfr'] = grp[numbercol]
+                grp['residual_rfr'] = 0
+                return grp
+
             model = RandomForestRegressor(n_estimators=50, random_state=42)
             model.fit(X, y)
 
@@ -707,87 +794,20 @@ def random_forest_outliers(
             df_out = process_group(df_pd)
 
         if showstats:
-            print(df_out[f"{numbercol}_is_outlier"].value_counts())
+            total_outliers = df_out[f"{numbercol}_is_outlier"].sum()
+            total_points = len(df_out)
+            print(f"[RANDOM FOREST OUTLIERS] {numbercol}: {total_outliers}/{total_points}")
+            if groupbycols and key is None:
+                # Show per-group statistics
+                group_stats = df_out.groupby(groupbycols)[f"{numbercol}_is_outlier"].agg(['sum', 'count'])
+                group_stats['percentage'] = (group_stats['sum'] / group_stats['count'] * 100).round(2)
+                print("Per-group outlier statistics:")
+                print(group_stats)
 
-        return spark.createDataFrame(df_out)
+        # Clean up temporary columns before converting back to Spark
+        df_out = df_out.drop(columns=['pred_rfr', 'residual_rfr'], errors='ignore')
 
-
-
-def isolation_forest_outliers(
-    spark_df,
-    numbercol='OBS_VALUE',
-    groupbycols=None,
-    contamination=0.05
-):
-    """
-    Isolation Forest outlier detection - tries Spark ML clustering first, falls back to pandas.
-    """
-    # Try Spark ML clustering approach first
-    try:
-        from pyspark.ml.feature import VectorAssembler, StandardScaler
-        from pyspark.ml.clustering import KMeans
-        from pyspark.ml import Pipeline
-        from pyspark.sql.functions import col
-
-        print("Attempting Spark ML clustering-based outlier detection...")
-
-        assembler = VectorAssembler(inputCols=[numbercol], outputCol="features_raw")
-        scaler = StandardScaler(inputCol="features_raw", outputCol="features")
-
-        # Use KMeans with many clusters to identify outliers
-        df_count = spark_df.count()
-        n_clusters = max(2, min(int(df_count * contamination * 10), 100))
-        kmeans = KMeans(k=n_clusters, seed=42, featuresCol="features", predictionCol="cluster")
-
-        pipeline = Pipeline(stages=[assembler, scaler, kmeans])
-        model = pipeline.fit(spark_df)
-
-        clustered = model.transform(spark_df)
-
-        # Mark smallest clusters as outliers
-        cluster_counts = clustered.groupBy("cluster").count()
-        small_clusters = cluster_counts.orderBy("count").limit(int(cluster_counts.count() * contamination))
-        small_cluster_ids = [row.cluster for row in small_clusters.collect()]
-
-        result = clustered.withColumn(f"{numbercol}_is_outlier", col("cluster").isin(small_cluster_ids))
-
-        print("✓ Spark ML clustering-based outlier detection succeeded")
-        return result.drop("features_raw", "features", "cluster")
-
-    except Exception as e:
-        print(f"✗ Spark ML clustering failed: {e}")
-        print("Falling back to pandas Isolation Forest...")
-
-        # Pandas fallback
-        df_pd = spark_df.toPandas()
-
-        def compute_isolation_forest(group_df):
-            if len(group_df) < 30:
-                group_df[f"{numbercol}_is_outlier"] = False
-                return group_df
-
-            values = group_df[numbercol].values.reshape(-1, 1)
-
-            try:
-                iso = IsolationForest(contamination=contamination, random_state=42)
-                outliers = iso.fit_predict(values) == -1
-                group_df[f"{numbercol}_is_outlier"] = outliers
-            except Exception:
-                group_df[f"{numbercol}_is_outlier"] = False
-
-            return group_df
-
-        if groupbycols:
-            df_result = (
-                df_pd.groupby(groupbycols, group_keys=False)
-                .apply(compute_isolation_forest)
-                .reset_index(drop=True)
-            )
-        else:
-            df_result = compute_isolation_forest(df_pd)
-
-        return spark_df.sql_ctx.createDataFrame(df_result)
-
+        return spark_df.sql_ctx.createDataFrame(df_out)
 
 def hbos_outliers(
     spark_df,
@@ -1300,7 +1320,7 @@ def plot_sliding_window_esma_plotly(
 # 5. MAIN SPOT FUNCTION
 # =============================================================================
 
-def spot(
+def spot_main(
     spark_df,
     mode='thresholds',
     numbercol='OBS_VALUE',
@@ -1343,7 +1363,7 @@ def spot(
         Input Spark DataFrame
     mode : str
         Detection method: 'thresholds', 'percentile', 'hbos', 'random_forest_regressor',
-        'arima', 'sliding_window', 'autoencoder', 'isolation_forest'
+        'arima', 'sliding_window', 'autoencoder'
     numbercol : str
         Numeric column to analyze (default: 'OBS_VALUE')
     groupbycols : list, optional
@@ -1431,8 +1451,11 @@ def spot(
             spark_df=spark_df,
             numbercol=numbercol,
             feature_cols=feature_cols,
+            nr_sd=nr_sd,
             groupbycols=groupbycols,
-            nr_sd=nr_sd
+            showstats=showstats,
+            key=key,
+            key_col=key_col
         )
 
         if return_mode == 'all':
@@ -1440,19 +1463,7 @@ def spot(
         elif return_mode == 'outliers':
             return df_with_outliers.filter(f.col(f"{numbercol}_is_outlier") == True)
 
-    elif mode == 'isolation_forest':
-        # Single function that tries Spark first, falls back to pandas
-        df_with_outliers = isolation_forest_outliers(
-            spark_df=spark_df,
-            numbercol=numbercol,
-            groupbycols=groupbycols,
-            contamination=contamination
-        )
 
-        if return_mode == 'all':
-            return df_with_outliers
-        elif return_mode == 'outliers':
-            return df_with_outliers.filter(f.col(f"{numbercol}_is_outlier") == True)
 
     # Time series methods
     elif mode == 'arima':
@@ -1504,6 +1515,7 @@ def spot(
 
     elif mode == 'autoencoder':
         # Use the new function that returns full Spark DataFrame
+        warnings.filterwarnings('ignore')
         df_with_outliers = fit_autoencoder_and_flag_outliers(
             spark_df=spark_df,
             numbercol=numbercol,
@@ -1543,7 +1555,6 @@ __all__ = [
     'add_outlier_hbos',
     'flag_outliers_hbos',
     'random_forest_outliers',
-    'isolation_forest_outliers',
     'hbos_outliers',
     'plot_global_series_with_outliers',
     'plot_arima_esma',
