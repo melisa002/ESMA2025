@@ -28,7 +28,7 @@ Basic usage with the main spot function for different detection methods includin
 
 Built-in ESMA-style plots with Plotly for ARIMA results and global outlier visualization.
 
-##Installation
+## Installation
 
 Required packages include pyspark, pandas, numpy, matplotlib, pmdarima, scikit-learn, tensorflow, and plotly.
 
